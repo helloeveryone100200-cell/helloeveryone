@@ -98,7 +98,7 @@ async def launch_child_bot(token: str, m_bot: Bot, c_bots: dict[str, Bot]) -> No
     async def _polling_task() -> None:
         logger.info("Starting polling for child bot @%s", bot_doc.get("bot_username", "?"))
         try:
-            await dp.start_polling(child_bot, handle_signals=False)
+            await dp.start_polling(child_bot, handle_signals=False, drop_pending_updates=True)
         except asyncio.CancelledError:
             logger.info("Polling cancelled for child bot token …%s", token[-8:])
         except Exception as exc:
@@ -164,9 +164,11 @@ async def main() -> None:
     logger.info("Health-check server listening on port %d", PORT)
 
     # 6. Start Mother Bot polling (blocks until shutdown).
+    # drop_pending_updates=True clears stale Telegram sessions on restart,
+    # preventing TelegramConflictError when a new deployment starts.
     logger.info("Mother Bot polling started.")
     try:
-        await mother_dp.start_polling(mother_bot, handle_signals=False)
+        await mother_dp.start_polling(mother_bot, handle_signals=False, drop_pending_updates=True)
     finally:
         logger.info("Shutting down — cancelling %d child bot task(s)…", len(child_tasks))
         for task in list(child_tasks.values()):
