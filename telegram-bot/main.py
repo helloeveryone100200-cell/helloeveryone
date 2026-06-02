@@ -3,6 +3,7 @@ main.py — Entry point for the Livegram Mother Bot platform.
 
 Responsibilities:
   • Set up Motor/MongoDB indexes on startup.
+  • Register BotFather-style menu commands for the Mother Bot and all child bots.
   • Launch the Mother Bot dispatcher.
   • Dynamically load all active (non-banned) child bots from MongoDB and start them.
   • Expose a lightweight aiohttp health-check server on $PORT (default 10000)
@@ -13,7 +14,6 @@ import asyncio
 import logging
 import os
 import signal
-import sys
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
@@ -22,7 +22,12 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import database as db
-from handlers import build_mother_router, build_child_router
+from handlers import (
+    build_mother_router,
+    build_child_router,
+    setup_mother_bot_commands,
+    setup_child_bot_commands,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -46,14 +51,12 @@ PORT: int = int(os.environ.get("PORT", 10000))
 # Shared runtime state
 # ---------------------------------------------------------------------------
 
-# mother_bot is the single global Bot instance for the Mother Bot.
 mother_bot: Bot = Bot(
     token=TELEGRAM_BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 
 # child_bots maps bot_token → running Bot instance.
-# It is mutated at runtime when bots are registered, banned, or unbanned.
 child_bots: dict[str, Bot] = {}
 
 # child_tasks maps bot_token → asyncio Task running that bot's polling loop.
@@ -61,12 +64,13 @@ child_tasks: dict[str, asyncio.Task] = {}
 
 
 # ---------------------------------------------------------------------------
-# Child bot launcher (callable from handlers.py for dynamic registration)
+# Child bot launcher
 # ---------------------------------------------------------------------------
 
 async def launch_child_bot(token: str, m_bot: Bot, c_bots: dict[str, Bot]) -> None:
     """
     Spin up a new child bot polling loop.
+    Also registers owner-scoped menu commands via set_my_commands.
     Safe to call multiple times — will skip if already running.
     """
     if token in c_bots:
@@ -83,6 +87,10 @@ async def launch_child_bot(token: str, m_bot: Bot, c_bots: dict[str, Bot]) -> No
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     c_bots[token] = child_bot
+
+    # Register owner-scoped menu commands for this child bot.
+    owner_id: int = bot_doc["owner_id"]
+    await setup_child_bot_commands(child_bot, owner_id)
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(build_child_router(child_bot, m_bot))
@@ -133,18 +141,21 @@ async def main() -> None:
     # 1. Set up database indexes (idempotent).
     await db.setup_indexes()
 
-    # 2. Build Mother Bot dispatcher.
+    # 2. Register Mother Bot command menus.
+    await setup_mother_bot_commands(mother_bot)
+
+    # 3. Build Mother Bot dispatcher.
     mother_dp = Dispatcher(storage=MemoryStorage())
     mother_dp.include_router(build_mother_router(mother_bot, child_bots))
 
-    # 3. Load and launch all active child bots concurrently.
+    # 4. Load and launch all active child bots concurrently.
     active_bots = await db.list_all_bots(banned=False)
     logger.info("Loading %d active child bot(s) from database…", len(active_bots))
     await asyncio.gather(
         *[launch_child_bot(b["bot_token"], mother_bot, child_bots) for b in active_bots]
     )
 
-    # 4. Start aiohttp health-check server in background.
+    # 5. Start aiohttp health-check server in background.
     web_app = build_web_app()
     runner = web.AppRunner(web_app)
     await runner.setup()
@@ -152,12 +163,11 @@ async def main() -> None:
     await site.start()
     logger.info("Health-check server listening on port %d", PORT)
 
-    # 5. Start Mother Bot polling (blocks until shutdown).
+    # 6. Start Mother Bot polling (blocks until shutdown).
     logger.info("Mother Bot polling started.")
     try:
         await mother_dp.start_polling(mother_bot, handle_signals=False)
     finally:
-        # Graceful shutdown: cancel all child tasks.
         logger.info("Shutting down — cancelling %d child bot task(s)…", len(child_tasks))
         for task in list(child_tasks.values()):
             task.cancel()
