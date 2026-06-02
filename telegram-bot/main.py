@@ -1,13 +1,5 @@
 """
-main.py — Entry point for the Livegram Mother Bot platform.
-
-Responsibilities:
-  • Set up Motor/MongoDB indexes on startup.
-  • Register BotFather-style menu commands for the Mother Bot and all child bots.
-  • Launch the Mother Bot dispatcher.
-  • Dynamically load all active (non-banned) child bots from MongoDB and start them.
-  • Expose a lightweight aiohttp health-check server on $PORT (default 10000)
-    so Render's health checks pass and UptimeRobot can ping for 24/7 uptime.
+main.py — Entry point for the Message Forwarding Mother Bot platform.
 """
 
 import asyncio
@@ -29,10 +21,6 @@ from handlers import (
     setup_child_bot_commands,
 )
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s — %(message)s",
@@ -40,38 +28,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
-
 TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 PORT: int = int(os.environ.get("PORT", 10000))
-
-# ---------------------------------------------------------------------------
-# Shared runtime state
-# ---------------------------------------------------------------------------
 
 mother_bot: Bot = Bot(
     token=TELEGRAM_BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 
-# child_bots maps bot_token → running Bot instance.
 child_bots: dict[str, Bot] = {}
-
-# child_tasks maps bot_token → asyncio Task running that bot's polling loop.
 child_tasks: dict[str, asyncio.Task] = {}
 
 
-# ---------------------------------------------------------------------------
-# Child bot launcher
-# ---------------------------------------------------------------------------
-
 async def launch_child_bot(token: str, m_bot: Bot, c_bots: dict[str, Bot]) -> None:
     """
-    Spin up a new child bot polling loop.
-    Also registers owner-scoped menu commands via set_my_commands.
-    Safe to call multiple times — will skip if already running.
+    Spin up a child bot polling loop. Safe to call multiple times.
+    Registers owner-scoped menu commands before starting polling.
     """
     if token in c_bots:
         logger.info("Child bot already running for token …%s", token[-8:])
@@ -88,7 +60,6 @@ async def launch_child_bot(token: str, m_bot: Bot, c_bots: dict[str, Bot]) -> No
     )
     c_bots[token] = child_bot
 
-    # Register owner-scoped menu commands for this child bot.
     owner_id: int = bot_doc["owner_id"]
     await setup_child_bot_commands(child_bot, owner_id)
 
@@ -96,13 +67,13 @@ async def launch_child_bot(token: str, m_bot: Bot, c_bots: dict[str, Bot]) -> No
     dp.include_router(build_child_router(child_bot, m_bot))
 
     async def _polling_task() -> None:
-        logger.info("Starting polling for child bot @%s", bot_doc.get("bot_username", "?"))
+        logger.info("Polling started: @%s", bot_doc.get("bot_username", "?"))
         try:
             await dp.start_polling(child_bot, handle_signals=False, drop_pending_updates=True)
         except asyncio.CancelledError:
-            logger.info("Polling cancelled for child bot token …%s", token[-8:])
+            logger.info("Polling cancelled: token …%s", token[-8:])
         except Exception as exc:
-            logger.exception("Child bot polling error (token …%s): %s", token[-8:], exc)
+            logger.exception("Child bot error (token …%s): %s", token[-8:], exc)
         finally:
             c_bots.pop(token, None)
             child_tasks.pop(token, None)
@@ -112,14 +83,9 @@ async def launch_child_bot(token: str, m_bot: Bot, c_bots: dict[str, Bot]) -> No
     child_tasks[token] = task
 
 
-# ---------------------------------------------------------------------------
-# aiohttp health-check server
-# ---------------------------------------------------------------------------
-
 async def handle_health(request: web.Request) -> web.Response:
-    active = len(child_bots)
     return web.Response(
-        text=f"OK — Mother Bot running | Active child bots: {active}",
+        text=f"OK | Active child bots: {len(child_bots)}",
         content_type="text/plain",
     )
 
@@ -131,46 +97,33 @@ def build_web_app() -> web.Application:
     return app
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
 async def main() -> None:
-    logger.info("=== Livegram Mother Bot Platform starting ===")
+    logger.info("=== Message Forwarding Mother Bot starting ===")
 
-    # 1. Set up database indexes (idempotent).
     await db.setup_indexes()
-
-    # 2. Register Mother Bot command menus.
     await setup_mother_bot_commands(mother_bot)
 
-    # 3. Build Mother Bot dispatcher.
     mother_dp = Dispatcher(storage=MemoryStorage())
     mother_dp.include_router(build_mother_router(mother_bot, child_bots))
 
-    # 4. Load and launch all active child bots concurrently.
     active_bots = await db.list_all_bots(banned=False)
-    logger.info("Loading %d active child bot(s) from database…", len(active_bots))
+    logger.info("Loading %d active child bot(s)…", len(active_bots))
     await asyncio.gather(
         *[launch_child_bot(b["bot_token"], mother_bot, child_bots) for b in active_bots]
     )
 
-    # 5. Start aiohttp health-check server in background.
     web_app = build_web_app()
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
-    logger.info("Health-check server listening on port %d", PORT)
+    logger.info("Health-check server on port %d", PORT)
 
-    # 6. Start Mother Bot polling (blocks until shutdown).
-    # drop_pending_updates=True clears stale Telegram sessions on restart,
-    # preventing TelegramConflictError when a new deployment starts.
     logger.info("Mother Bot polling started.")
     try:
         await mother_dp.start_polling(mother_bot, handle_signals=False, drop_pending_updates=True)
     finally:
-        logger.info("Shutting down — cancelling %d child bot task(s)…", len(child_tasks))
+        logger.info("Shutting down %d child bot(s)…", len(child_tasks))
         for task in list(child_tasks.values()):
             task.cancel()
         await asyncio.gather(*child_tasks.values(), return_exceptions=True)
@@ -180,7 +133,7 @@ async def main() -> None:
 
 
 def _handle_signal(sig: signal.Signals) -> None:
-    logger.info("Received signal %s — initiating shutdown.", sig.name)
+    logger.info("Signal %s — shutting down.", sig.name)
     for task in asyncio.all_tasks():
         task.cancel()
 
@@ -193,6 +146,6 @@ if __name__ == "__main__":
     try:
         loop.run_until_complete(main())
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("Livegram platform stopped.")
+        logger.info("Platform stopped.")
     finally:
         loop.close()
