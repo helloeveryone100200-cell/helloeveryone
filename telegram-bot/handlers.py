@@ -3,20 +3,22 @@ handlers.py — All bot handlers for the Livegram Mother Bot platform.
 
 Covers:
   • Mother Bot: user onboarding, token registration, admin commands.
-  • Child Bot: customer flows, owner control panel, message routing (Livegram engine).
+  • Child Bot: customer flows, owner control panel (inline + /commands), message routing.
 """
 
 import asyncio
 import logging
 import os
-from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ContentType, ParseMode
+from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -80,6 +82,57 @@ def _build_welcome(custom_text: str, mother_username: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Command menu setup helpers
+# ---------------------------------------------------------------------------
+
+async def setup_mother_bot_commands(bot: Bot) -> None:
+    """
+    Register BotFather-style menu commands for the Mother Bot.
+    - Default scope: /start only (visible to all users).
+    - Admin scope: full admin command list (visible only to ADMIN_ID).
+    """
+    default_cmds = [
+        BotCommand(command="start", description="🚀 Register your bot / Get started"),
+    ]
+    admin_cmds = [
+        BotCommand(command="start",      description="🚀 Register a new bot"),
+        BotCommand(command="stats",      description="📊 View platform statistics"),
+        BotCommand(command="broadcast",  description="📢 Broadcast to all bot owners"),
+        BotCommand(command="ban_bot",    description="🚫 Ban a child bot"),
+        BotCommand(command="unban_bot",  description="✅ Unban a child bot"),
+        BotCommand(command="force_clean",description="🔧 Re-verify database indexes"),
+    ]
+    try:
+        await bot.set_my_commands(default_cmds, scope=BotCommandScopeDefault())
+        await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+        logger.info("Mother Bot command menus registered.")
+    except Exception as exc:
+        logger.warning("Could not set Mother Bot commands: %s", exc)
+
+
+async def setup_child_bot_commands(bot: Bot, owner_id: int) -> None:
+    """
+    Register BotFather-style menu commands for a child bot.
+    - Default scope: empty (customers see no command list).
+    - Owner scope: full owner management commands (visible only to the owner).
+    """
+    owner_cmds = [
+        BotCommand(command="panel",     description="🎛 Open management panel"),
+        BotCommand(command="broadcast", description="📢 Broadcast message to customers"),
+        BotCommand(command="welcome",   description="⚙️ Change welcome message"),
+        BotCommand(command="stats",     description="📊 View my bot statistics"),
+    ]
+    try:
+        # Clear default commands so customers see a clean interface
+        await bot.delete_my_commands(scope=BotCommandScopeDefault())
+        # Set owner-only commands
+        await bot.set_my_commands(owner_cmds, scope=BotCommandScopeChat(chat_id=owner_id))
+        logger.info("Child bot command menu set for owner %d.", owner_id)
+    except Exception as exc:
+        logger.warning("Could not set child bot commands (owner %d): %s", owner_id, exc)
+
+
+# ---------------------------------------------------------------------------
 # MOTHER BOT ROUTER
 # ---------------------------------------------------------------------------
 
@@ -87,7 +140,6 @@ def build_mother_router(mother_bot: Bot, child_bots: dict[str, Bot]) -> Router:
     """
     Returns the router for the Mother Bot.
     child_bots is a live mutable dict: {bot_token: Bot instance}.
-    It is shared with main.py so dynamically spawned bots are visible.
     """
     router = Router(name="mother")
 
@@ -116,14 +168,12 @@ def build_mother_router(mother_bot: Bot, child_bots: dict[str, Bot]) -> Router:
             await message.answer("❌ Please send a valid bot token string.")
             return
 
-        # Check duplicate
         existing = await db.get_bot_by_token(token)
         if existing:
             await message.answer("⚠️ This bot token is already registered on the platform.")
             await state.clear()
             return
 
-        # Validate token via Telegram API
         status_msg = await message.answer("🔄 Validating your token…")
         try:
             probe_bot = Bot(token=token)
@@ -141,7 +191,6 @@ def build_mother_router(mother_bot: Bot, child_bots: dict[str, Bot]) -> Router:
 
         owner_id: int = message.from_user.id
 
-        # Persist to DB
         await db.insert_user_bot(
             owner_id=owner_id,
             bot_token=token,
@@ -150,19 +199,19 @@ def build_mother_router(mother_bot: Bot, child_bots: dict[str, Bot]) -> Router:
             is_banned=False,
         )
 
-        # Auto-set child bot description (best-effort, non-blocking)
         mother_username = await _get_mother_username(mother_bot)
-        asyncio.create_task(
-            _set_child_bot_descriptions(token, mother_username)
-        )
+        asyncio.create_task(_set_child_bot_descriptions(token, mother_username))
 
-        # Dynamically spin up the child bot
-        from main import launch_child_bot  # imported here to avoid circular at module level
+        from main import launch_child_bot
         asyncio.create_task(launch_child_bot(token, mother_bot, child_bots))
 
         await status_msg.edit_text(
             f"✅ *Success!* Your bot @{bot_username} is now live.\n\n"
-            f"Customers can message it and you'll receive their messages here.\n"
+            f"Open @{bot_username} and use the *menu button* (/) to manage it:\n"
+            f"  • /panel — Open control panel\n"
+            f"  • /broadcast — Broadcast to customers\n"
+            f"  • /welcome — Change welcome message\n"
+            f"  • /stats — View statistics\n\n"
             f"Reply to any forwarded message to reply back to the customer.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -201,7 +250,9 @@ def build_mother_router(mother_bot: Bot, child_bots: dict[str, Bot]) -> Router:
         sent = 0
         for uid in owner_ids:
             try:
-                await mother_bot.send_message(uid, f"📢 *Announcement*\n\n{text_body}", parse_mode=ParseMode.MARKDOWN)
+                await mother_bot.send_message(
+                    uid, f"📢 *Announcement*\n\n{text_body}", parse_mode=ParseMode.MARKDOWN
+                )
                 sent += 1
             except Exception:
                 pass
@@ -222,7 +273,6 @@ def build_mother_router(mother_bot: Bot, child_bots: dict[str, Bot]) -> Router:
             return
         token = bot_doc["bot_token"]
         modified = await db.set_bot_banned(username, True)
-        # Stop running instance
         if token in child_bots:
             try:
                 await child_bots[token].session.close()
@@ -265,7 +315,6 @@ def build_mother_router(mother_bot: Bot, child_bots: dict[str, Bot]) -> Router:
 
 
 async def _set_child_bot_descriptions(token: str, mother_username: str) -> None:
-    """Best-effort: set child bot profile text to link back to the Mother Bot."""
     try:
         child = Bot(token=token)
         desc = f"Customer Support Bot 🔗 Created via @{mother_username}"
@@ -283,7 +332,7 @@ async def _set_child_bot_descriptions(token: str, mother_username: str) -> None:
 def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
     """
     Returns a router for a single child bot instance.
-    Each child bot gets its own Dispatcher with its own router.
+    Includes both /command handlers and inline panel callbacks for the owner.
     """
     router = Router(name=f"child_{child_bot.token[:10]}")
     child_token = child_bot.token
@@ -291,7 +340,14 @@ def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
     async def _bot_doc() -> dict | None:
         return await db.get_bot_by_token(child_token)
 
-    # --- /start for customers and owners ---
+    async def _is_owner(user_id: int) -> tuple[bool, dict | None]:
+        doc = await _bot_doc()
+        if not doc:
+            return False, None
+        return user_id == doc["owner_id"], doc
+
+    # ── /start ───────────────────────────────────────────────────────────────
+
     @router.message(CommandStart())
     async def child_start(message: Message) -> None:
         doc = await _bot_doc()
@@ -303,24 +359,87 @@ def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
         if user_id == owner_id:
             await message.answer(
                 "👋 Welcome back! You are the *owner* of this bot.\n\n"
-                "Send any message here to manage your bot:",
+                "Use the *menu button* (/) or tap below to manage your bot:",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=_owner_panel_keyboard(),
             )
             return
 
-        # Register customer (silent duplicate guard via unique index)
         await db.register_customer(child_token, user_id)
-
         mother_username = await _get_mother_username(mother_bot)
         welcome_text = _build_welcome(doc.get("custom_welcome", ""), mother_username)
         await message.answer(welcome_text, reply_markup=_customer_keyboard())
 
-    # --- Customer keyboard buttons ---
+    # ── Owner /panel command ──────────────────────────────────────────────────
+
+    @router.message(Command("panel"))
+    async def owner_cmd_panel(message: Message, state: FSMContext) -> None:
+        is_owner, doc = await _is_owner(message.from_user.id)
+        if not is_owner:
+            return
+        await state.clear()
+        await message.answer(
+            "🎛 *Management Panel*\n\nChoose an action:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_owner_panel_keyboard(),
+        )
+
+    # ── Owner /broadcast command ──────────────────────────────────────────────
+
+    @router.message(Command("broadcast"))
+    async def owner_cmd_broadcast(message: Message, state: FSMContext) -> None:
+        is_owner, doc = await _is_owner(message.from_user.id)
+        if not is_owner:
+            return
+        await state.clear()
+        await message.answer(
+            "📢 *Broadcast Mode*\n\n"
+            "Send the message you want to deliver to all your customers.\n"
+            "_(You can send text, photos, videos, voice notes, or documents.)_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await state.set_state(ChildOwnerStates.broadcasting)
+
+    # ── Owner /welcome command ────────────────────────────────────────────────
+
+    @router.message(Command("welcome"))
+    async def owner_cmd_welcome(message: Message, state: FSMContext) -> None:
+        is_owner, doc = await _is_owner(message.from_user.id)
+        if not is_owner:
+            return
+        await state.clear()
+        mother_username = await _get_mother_username(mother_bot)
+        await message.answer(
+            f"⚙️ *Change Welcome Message*\n\n"
+            f"Send your new welcome text.\n"
+            f"The branding footer is always appended automatically:\n"
+            f"`🤖 Powered by @{mother_username}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await state.set_state(ChildOwnerStates.changing_welcome)
+
+    # ── Owner /stats command ──────────────────────────────────────────────────
+
+    @router.message(Command("stats"))
+    async def owner_cmd_stats(message: Message) -> None:
+        is_owner, doc = await _is_owner(message.from_user.id)
+        if not is_owner:
+            return
+        total = await db.count_customers(child_token)
+        await message.answer(
+            f"📊 *Your Bot Statistics*\n\n"
+            f"👥 Unique customers who messaged this bot: `{total}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    # ── Customer keyboard buttons ─────────────────────────────────────────────
+
     @router.message(F.text == "ℹ️ About Us")
     async def child_about(message: Message) -> None:
-        doc = await _bot_doc()
-        if not doc or message.from_user.id == doc["owner_id"]:
+        is_owner, _ = await _is_owner(message.from_user.id)
+        if is_owner:
             return
         await message.answer(
             "ℹ️ *About Us*\n\n"
@@ -331,39 +450,42 @@ def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
 
     @router.message(F.text == "📞 Contact Support")
     async def child_contact(message: Message) -> None:
-        doc = await _bot_doc()
-        if not doc or message.from_user.id == doc["owner_id"]:
+        is_owner, _ = await _is_owner(message.from_user.id)
+        if is_owner:
             return
         await message.answer(
             "📞 Please type your message below, and our team will get back to you as soon as possible."
         )
 
-    # --- Owner inline callback: Broadcast ---
+    # ── Owner inline panel callbacks ──────────────────────────────────────────
+
     @router.callback_query(F.data == "owner:broadcast")
     async def owner_cb_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
-        doc = await _bot_doc()
-        if not doc or callback.from_user.id != doc["owner_id"]:
+        is_owner, _ = await _is_owner(callback.from_user.id)
+        if not is_owner:
             await callback.answer("Not authorised.", show_alert=True)
             return
         await callback.message.answer(
-            "📢 *Broadcast Mode*\n\nSend the message you want to broadcast to all your customers.",
+            "📢 *Broadcast Mode*\n\n"
+            "Send the message you want to deliver to all your customers.\n"
+            "_(You can send text, photos, videos, voice notes, or documents.)_",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=ReplyKeyboardRemove(),
         )
         await state.set_state(ChildOwnerStates.broadcasting)
         await callback.answer()
 
-    # --- Owner inline callback: Change Welcome ---
     @router.callback_query(F.data == "owner:welcome")
     async def owner_cb_welcome(callback: CallbackQuery, state: FSMContext) -> None:
-        doc = await _bot_doc()
-        if not doc or callback.from_user.id != doc["owner_id"]:
+        is_owner, _ = await _is_owner(callback.from_user.id)
+        if not is_owner:
             await callback.answer("Not authorised.", show_alert=True)
             return
         mother_username = await _get_mother_username(mother_bot)
         await callback.message.answer(
             f"⚙️ *Change Welcome Message*\n\n"
-            f"Send your new welcome text. Note: the branding footer is automatically appended:\n"
+            f"Send your new welcome text.\n"
+            f"The branding footer is always appended automatically:\n"
             f"`🤖 Powered by @{mother_username}`",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=ReplyKeyboardRemove(),
@@ -371,11 +493,10 @@ def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
         await state.set_state(ChildOwnerStates.changing_welcome)
         await callback.answer()
 
-    # --- Owner inline callback: Stats ---
     @router.callback_query(F.data == "owner:stats")
     async def owner_cb_stats(callback: CallbackQuery) -> None:
-        doc = await _bot_doc()
-        if not doc or callback.from_user.id != doc["owner_id"]:
+        is_owner, _ = await _is_owner(callback.from_user.id)
+        if not is_owner:
             await callback.answer("Not authorised.", show_alert=True)
             return
         total = await db.count_customers(child_token)
@@ -386,18 +507,23 @@ def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
         )
         await callback.answer()
 
-    # --- FSM: owner broadcast message ---
+    # ── FSM: execute broadcast ────────────────────────────────────────────────
+
     @router.message(StateFilter(ChildOwnerStates.broadcasting))
     async def owner_do_broadcast(message: Message, state: FSMContext) -> None:
-        doc = await _bot_doc()
-        if not doc or message.from_user.id != doc["owner_id"]:
+        is_owner, doc = await _is_owner(message.from_user.id)
+        if not is_owner:
             await state.clear()
             return
         customers = await db.list_customers(child_token)
         sent = 0
         for cid in customers:
             try:
-                await child_bot.forward_message(chat_id=cid, from_chat_id=message.chat.id, message_id=message.message_id)
+                await child_bot.copy_message(
+                    chat_id=cid,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                )
                 sent += 1
             except Exception:
                 pass
@@ -407,11 +533,12 @@ def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
         )
         await state.clear()
 
-    # --- FSM: owner change welcome ---
+    # ── FSM: save new welcome ─────────────────────────────────────────────────
+
     @router.message(StateFilter(ChildOwnerStates.changing_welcome))
     async def owner_do_change_welcome(message: Message, state: FSMContext) -> None:
-        doc = await _bot_doc()
-        if not doc or message.from_user.id != doc["owner_id"]:
+        is_owner, doc = await _is_owner(message.from_user.id)
+        if not is_owner:
             await state.clear()
             return
         new_text = message.text.strip() if message.text else ""
@@ -428,7 +555,8 @@ def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
         )
         await state.clear()
 
-    # --- Catch-all: forward customer messages to owner, route owner replies ---
+    # ── Catch-all: forward customer → owner, route owner reply → customer ─────
+
     @router.message()
     async def child_catch_all(message: Message) -> None:
         doc = await _bot_doc()
@@ -437,9 +565,7 @@ def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
         owner_id: int = doc["owner_id"]
         user_id: int = message.from_user.id
 
-        # ── OWNER SIDE: handle reply to a forwarded customer message ─────────
         if user_id == owner_id:
-            # If the owner replied to a message, try to route it back to the customer.
             if message.reply_to_message:
                 pair = await db.find_pair_by_owner_msg(child_token, message.reply_to_message.message_id)
                 if pair:
@@ -454,14 +580,14 @@ def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
                         logger.warning("Failed to route reply to customer %s: %s", customer_id, exc)
                         await message.answer("⚠️ Could not deliver reply — customer may have blocked the bot.")
                     return
-            # Otherwise show control panel
             await message.answer(
-                "👇 Use the control panel to manage your bot:",
+                "👇 Use the *menu button* (/) or tap below to manage your bot:",
+                parse_mode=ParseMode.MARKDOWN,
                 reply_markup=_owner_panel_keyboard(),
             )
             return
 
-        # ── CUSTOMER SIDE: forward message to owner ───────────────────────────
+        # Customer → forward to owner
         await db.register_customer(child_token, user_id)
         username = message.from_user.username
         name = message.from_user.full_name
@@ -470,20 +596,13 @@ def build_child_router(child_bot: Bot, mother_bot: Bot) -> Router:
             + (f" (@{username})" if username else "")
             + f"\n`ID: {user_id}`"
         )
-
         try:
-            header_msg = await child_bot.send_message(
-                owner_id,
-                header,
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            # Forward the actual content
+            await child_bot.send_message(owner_id, header, parse_mode=ParseMode.MARKDOWN)
             fwd_msg = await child_bot.forward_message(
                 chat_id=owner_id,
                 from_chat_id=message.chat.id,
                 message_id=message.message_id,
             )
-            # Save pair so owner can reply
             await db.save_message_pair(
                 child_bot_id=child_token,
                 owner_msg_id=fwd_msg.message_id,
