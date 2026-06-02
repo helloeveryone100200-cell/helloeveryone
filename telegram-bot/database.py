@@ -1,5 +1,5 @@
 """
-database.py — Motor async MongoDB client and index setup for Livegram Mother Bot.
+database.py — Motor async MongoDB client and index setup.
 """
 
 import os
@@ -39,30 +39,23 @@ def col_message_pairs():
 
 async def setup_indexes() -> None:
     """
-    Idempotently create all required MongoDB indexes on startup.
-
-    - bot_customers: unique composite index on (bot_id, customer_id)
-      to prevent duplicate tracking entries and storage bloat.
-    - message_pairs: TTL index on created_at set to 48 hours (172800 s)
-      so old routing records are automatically deleted by MongoDB.
+    Idempotently create all required indexes on startup.
+    - bot_customers: unique (bot_id, customer_id) — prevents duplicate tracking.
+    - message_pairs: TTL on created_at (48 h) — auto-deletes old routing records.
     """
     logger.info("Setting up MongoDB indexes…")
 
-    # Unique composite index: prevents duplicate (bot_id, customer_id) entries.
     await col_bot_customers().create_index(
         [("bot_id", 1), ("customer_id", 1)],
         unique=True,
         name="bot_customer_unique",
     )
-    logger.info("Index 'bot_customer_unique' ensured on bot_customers.")
 
-    # TTL index: MongoDB removes documents 48 h after created_at.
     await col_message_pairs().create_index(
         [("created_at", 1)],
         expireAfterSeconds=172800,
         name="message_pairs_ttl_48h",
     )
-    logger.info("Index 'message_pairs_ttl_48h' ensured on message_pairs.")
 
     logger.info("All indexes are in place.")
 
@@ -83,6 +76,12 @@ async def get_owner_bot(owner_id: int) -> dict | None:
     return await col_user_bots().find_one({"owner_id": owner_id})
 
 
+async def list_owner_bots(owner_id: int) -> list[dict]:
+    """Return all bots belonging to a given owner."""
+    cursor = col_user_bots().find({"owner_id": owner_id})
+    return await cursor.to_list(length=None)
+
+
 async def insert_user_bot(
     owner_id: int,
     bot_token: str,
@@ -97,8 +96,20 @@ async def insert_user_bot(
             "bot_username": bot_username,
             "custom_welcome": custom_welcome,
             "is_banned": is_banned,
+            "incoming_count": 0,
+            "outgoing_count": 0,
+            "blocked_count": 0,
+            "created_at": datetime.now(timezone.utc),
         }
     )
+
+
+async def remove_bot(bot_token: str) -> bool:
+    """Permanently delete a bot record from the database."""
+    result = await col_user_bots().delete_one({"bot_token": bot_token})
+    # Also remove its customer records to prevent data bloat.
+    await col_bot_customers().delete_many({"bot_id": bot_token})
+    return result.deleted_count > 0
 
 
 async def set_bot_banned(bot_username: str, banned: bool) -> bool:
@@ -127,18 +138,46 @@ async def list_all_owners() -> list[int]:
     return [d["owner_id"] for d in docs]
 
 
+async def increment_incoming(bot_token: str) -> None:
+    """Atomically increment the incoming message counter — no extra documents."""
+    await col_user_bots().update_one(
+        {"bot_token": bot_token},
+        {"$inc": {"incoming_count": 1}},
+    )
+
+
+async def increment_outgoing(bot_token: str) -> None:
+    """Atomically increment the outgoing message counter."""
+    await col_user_bots().update_one(
+        {"bot_token": bot_token},
+        {"$inc": {"outgoing_count": 1}},
+    )
+
+
+async def increment_blocked(bot_token: str) -> None:
+    """Atomically increment the blocked-by-customer counter."""
+    await col_user_bots().update_one(
+        {"bot_token": bot_token},
+        {"$inc": {"blocked_count": 1}},
+    )
+
+
 # ---------------------------------------------------------------------------
 # bot_customers helpers
 # ---------------------------------------------------------------------------
 
-async def register_customer(bot_id: str, customer_id: int) -> None:
-    """Insert silently; ignore duplicate key errors (index enforces uniqueness)."""
+async def register_customer(bot_id: str, customer_id: int) -> bool:
+    """
+    Register a customer for a bot. Returns True if newly added, False if duplicate.
+    The unique index on (bot_id, customer_id) silently rejects duplicates.
+    """
     try:
         await col_bot_customers().insert_one(
             {"bot_id": bot_id, "customer_id": customer_id}
         )
+        return True
     except Exception:
-        pass  # Duplicate — already tracked.
+        return False
 
 
 async def list_customers(bot_id: str) -> list[int]:
